@@ -28,6 +28,26 @@ uv run python scrape_nptel_cse.py
 ## Options
 
 - `-o`, `--output`: Output directory (default: `nptel_cse_syllabi`)
+- `--courses-file`: Path to JSON list of courses (default: `cse_courses.json`)
+- `--discover`: Also discover additional CSE (`106*`) courses from the NPTEL portal
+- `--discover-all`: Discover all courses across all disciplines from the NPTEL portal
+- `--resume`: Skip courses already present in `<output>/courses_metadata.json`
+- `--exclude-metadata`: Path to an existing `courses_metadata.json` whose courses should be skipped (repeatable)
+- `--workers`: Number of concurrent browser workers (default: `1`)
 - `--limit`: Max number of courses to process (for quick testing)
 - `--delay`: Seconds to wait between requests (default: `0.5`)
 - `--headed`: Show the Chromium browser window while scraping
+
+## Scraping Only Newer Courses in the Future
+
+To discover all courses on NPTEL and scrape **only new courses** into `wholeNPTEL/` (skipping everything already in `wholeNPTEL/courses_metadata.json`):
+
+```bash
+uv run python scrape_nptel_cse.py --courses-file whole_nptel_courses.json -o wholeNPTEL --discover-all --resume --workers 10 --delay 0.1
+```
+
+Or to save only the newly discovered courses into a **separate folder** (e.g., `new_courses/`) while still skipping everything already scraped in `wholeNPTEL/`:
+
+```bash
+uv run python scrape_nptel_cse.py --courses-file whole_nptel_courses.json -o new_courses --discover-all --exclude-metadata wholeNPTEL/courses_metadata.json --workers 10 --delay 0.1
+```

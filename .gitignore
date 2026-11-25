@@ -14,4 +14,9 @@ __pycache__/
 
 # Scraped output (keep local only)
 nptel_cse_syllabi/
+nptel_math_basic_syllabi/
+wholeNPTEL/
+all md/
+*.pdf
+mathCombined.txt
 

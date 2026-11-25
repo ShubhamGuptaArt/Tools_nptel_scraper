@@ -20,7 +20,9 @@ import argparse
 import csv
 import json
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -118,27 +120,33 @@ def download_pdf(url: str, dest: Path, timeout: int = 25) -> bool:
     return True
 
 
-def discover_cse_courses(page: Page, max_scrolls: int = 60, limit: Optional[int] = None) -> list[dict[str, str]]:
-    """Load NPTEL courses portal and collect CSE (prefix 106) course IDs and basic info."""
+def discover_cse_courses(
+    page: Page,
+    max_scrolls: int = 60,
+    limit: Optional[int] = None,
+    all_disciplines: bool = False,
+) -> list[dict[str, str]]:
+    """Load NPTEL courses portal and collect course IDs and basic info."""
     print(f"Loading {COURSES_PORTAL_URL} ...")
     page.goto(COURSES_PORTAL_URL, wait_until="networkidle", timeout=60000)
 
-    # Attempt to select Computer Science and Engineering discipline filter if present
-    filter_selectors = [
-        "text=/Computer Science and Engineering/i",
-        "label:has-text('Computer Science')",
-        "option:has-text('Computer Science')",
-    ]
-    for selector in filter_selectors:
-        try:
-            loc = page.locator(selector).first
-            if loc.is_visible(timeout=2000):
-                loc.click()
-                page.wait_for_timeout(1500)
-                print(f"Applied CSE filter via selector: {selector}")
-                break
-        except Exception:
-            continue
+    if not all_disciplines:
+        # Attempt to select Computer Science and Engineering discipline filter if present
+        filter_selectors = [
+            "text=/Computer Science and Engineering/i",
+            "label:has-text('Computer Science')",
+            "option:has-text('Computer Science')",
+        ]
+        for selector in filter_selectors:
+            try:
+                loc = page.locator(selector).first
+                if loc.is_visible(timeout=2000):
+                    loc.click()
+                    page.wait_for_timeout(1500)
+                    print(f"Applied CSE filter via selector: {selector}")
+                    break
+            except Exception:
+                continue
 
     # Scroll to load lazy-rendered course cards
     prev_height = 0
@@ -158,7 +166,8 @@ def discover_cse_courses(page: Page, max_scrolls: int = 60, limit: Optional[int]
         href = a["href"].split("?")[0].rstrip("/")
         parts = href.split("/")
         cid = parts[-1] if parts else ""
-        if cid.isdigit() and cid.startswith("106"):
+        is_match = (cid.isdigit() and len(cid) >= 6) if all_disciplines else (cid.isdigit() and cid.startswith("106"))
+        if is_match:
             card_text = " ".join(a.get_text(" ", strip=True).split())
             if cid not in discovered:
                 discovered[cid] = {
@@ -170,7 +179,8 @@ def discover_cse_courses(page: Page, max_scrolls: int = 60, limit: Optional[int]
     courses = [discovered[cid] for cid in sorted(discovered)]
     if limit is not None:
         courses = courses[:limit]
-    print(f"Discovered {len(courses)} CSE (106*) courses.")
+    label = "all" if all_disciplines else "CSE (106*)"
+    print(f"Discovered {len(courses)} {label} courses.")
     return courses
 
 
@@ -492,8 +502,9 @@ def load_courses_list(
     discover: bool,
     limit: Optional[int],
     course_ids: Optional[list[str]] = None,
+    discover_all: bool = False,
 ) -> list[dict[str, str]]:
-    """Load CSE courses from cse_courses.json if available, optionally merging live discovery."""
+    """Load courses from JSON if available, optionally merging live discovery."""
     by_id: dict[str, dict[str, str]] = {}
 
     if courses_file and courses_file.exists():
@@ -505,10 +516,10 @@ def load_courses_list(
                 "hint_text": str(entry.get("title", "")),
                 "course_url": str(entry.get("course_url", COURSE_DETAIL_URL.format(course_id=cid))),
             }
-        print(f"Loaded {len(by_id)} CSE courses from {courses_file.name}.")
+        print(f"Loaded {len(by_id)} courses from {courses_file.name}.")
 
-    if discover or not by_id:
-        for item in discover_cse_courses(page):
+    if discover or discover_all or not by_id:
+        for item in discover_cse_courses(page, all_disciplines=discover_all):
             cid = item["course_id"]
             if cid not in by_id:
                 by_id[cid] = item
@@ -533,6 +544,112 @@ def load_courses_list(
     return courses
 
 
+def _process_single_course(
+    item: dict[str, str],
+    idx: int,
+    total: int,
+    output_dir: Path,
+    page: Page,
+    file_lock: threading.Lock,
+    delay: float,
+) -> CourseRecord:
+    cid = item["course_id"]
+    hint = item["hint_text"]
+    print(f"[{idx}/{total}] Processing course {cid} ...", flush=True)
+
+    try:
+        info = parse_course_page(page, cid, hint)
+    except PlaywrightTimeoutError:
+        print(f"  ! Timeout loading course page {cid}, trying direct archive PDF...", flush=True)
+        info = {
+            "course_id": cid,
+            "title": hint or f"NPTEL_Course_{cid}",
+            "year": extract_year(hint),
+            "instructor": "",
+            "institute": "",
+            "duration": "",
+            "course_url": COURSE_DETAIL_URL.format(course_id=cid),
+            "pdf_links": [ARCHIVE_PDF_URL.format(course_id=cid)],
+            "details_body": "",
+            "lessons_body": "",
+        }
+    except Exception as exc:
+        print(f"  ! Error loading course page {cid}: {exc}", flush=True)
+        info = {
+            "course_id": cid,
+            "title": hint or f"NPTEL_Course_{cid}",
+            "year": extract_year(hint),
+            "instructor": "",
+            "institute": "",
+            "duration": "",
+            "course_url": COURSE_DETAIL_URL.format(course_id=cid),
+            "pdf_links": [ARCHIVE_PDF_URL.format(course_id=cid)],
+            "details_body": "",
+            "lessons_body": "",
+        }
+
+    year = str(info["year"])
+    title = str(info["title"])
+    base_stem = sanitize_filename(f"{year} - {title}")
+
+    saved_path: Optional[Path] = None
+    details_path: Optional[Path] = None
+    lessons_path: Optional[Path] = None
+    source_url = ""
+    fmt = "failed"
+
+    for pdf_url in info["pdf_links"]:  # type: ignore[attr-defined]
+        with file_lock:
+            candidate = unique_filepath(output_dir, base_stem, "pdf", cid)
+            candidate.touch()
+        if download_pdf(pdf_url, candidate):
+            saved_path = candidate
+            source_url = pdf_url
+            fmt = "pdf"
+            print(f"  [{cid}] -> Saved PDF: {candidate.name}", flush=True)
+            break
+        else:
+            with file_lock:
+                candidate.unlink(missing_ok=True)
+
+    if saved_path is None and info["details_body"]:
+        with file_lock:
+            candidate = unique_filepath(output_dir, f"{base_stem} - Syllabus", "md", cid)
+            write_markdown_syllabus(candidate, info)
+        saved_path = candidate
+        source_url = str(info["course_url"])
+        fmt = "md"
+        print(f"  [{cid}] -> Saved Syllabus MD: {candidate.name}", flush=True)
+
+    if info["details_body"]:
+        with file_lock:
+            details_path = unique_filepath(output_dir, f"{base_stem} - Details", "md", cid)
+            write_details_markdown(details_path, info)
+
+    if info["lessons_body"]:
+        with file_lock:
+            lessons_path = unique_filepath(output_dir, f"{base_stem} - Lessons", "md", cid)
+            write_lessons_markdown(lessons_path, info)
+
+    if delay > 0:
+        time.sleep(delay)
+
+    return CourseRecord(
+        course_id=cid,
+        title=title,
+        year=year,
+        instructor=str(info["instructor"]),
+        institute=str(info["institute"]),
+        duration=str(info["duration"]),
+        course_url=str(info["course_url"]),
+        syllabus_format=fmt,
+        syllabus_source_url=source_url,
+        saved_file=str(saved_path.name) if saved_path else "",
+        details_file=str(details_path.name) if details_path else "",
+        lessons_file=str(lessons_path.name) if lessons_path else "",
+    )
+
+
 def run_scraper(
     output_dir: Path,
     courses_file: Optional[Path],
@@ -541,9 +658,14 @@ def run_scraper(
     delay: float,
     headless: bool,
     course_ids: Optional[list[str]] = None,
+    workers: int = 1,
+    resume: bool = False,
+    discover_all: bool = False,
+    exclude_metadata: Optional[list[Path]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     records: list[CourseRecord] = []
+    file_lock = threading.Lock()
 
     with sync_playwright() as p:
         browser: Browser = p.chromium.launch(headless=headless)
@@ -556,89 +678,90 @@ def run_scraper(
             discover=discover,
             limit=limit,
             course_ids=course_ids,
+            discover_all=discover_all,
         )
-        total = len(courses)
-
-        for idx, item in enumerate(courses, start=1):
-            cid = item["course_id"]
-            hint = item["hint_text"]
-            print(f"[{idx}/{total}] Processing course {cid} ...")
-
-            try:
-                info = parse_course_page(page, cid, hint)
-            except PlaywrightTimeoutError:
-                print(f"  ! Timeout loading course page {cid}, trying direct archive PDF...")
-                info = {
-                    "course_id": cid,
-                    "title": hint or f"NPTEL_Course_{cid}",
-                    "year": extract_year(hint),
-                    "instructor": "",
-                    "institute": "",
-                    "duration": "",
-                    "course_url": COURSE_DETAIL_URL.format(course_id=cid),
-                    "pdf_links": [ARCHIVE_PDF_URL.format(course_id=cid)],
-                    "details_body": "",
-                    "lessons_body": "",
-                }
-
-            year = str(info["year"])
-            title = str(info["title"])
-            base_stem = sanitize_filename(f"{year} - {title}")
-
-            saved_path: Optional[Path] = None
-            details_path: Optional[Path] = None
-            lessons_path: Optional[Path] = None
-            source_url = ""
-            fmt = "failed"
-
-            for pdf_url in info["pdf_links"]:  # type: ignore[attr-defined]
-                candidate = unique_filepath(output_dir, base_stem, "pdf", cid)
-                if download_pdf(pdf_url, candidate):
-                    saved_path = candidate
-                    source_url = pdf_url
-                    fmt = "pdf"
-                    print(f"  -> Saved PDF: {candidate.name}")
-                    break
-
-            if saved_path is None and info["details_body"]:
-                candidate = unique_filepath(output_dir, f"{base_stem} - Syllabus", "md", cid)
-                write_markdown_syllabus(candidate, info)
-                saved_path = candidate
-                source_url = str(info["course_url"])
-                fmt = "md"
-                print(f"  -> Saved Syllabus MD: {candidate.name}")
-
-            if info["details_body"]:
-                details_path = unique_filepath(output_dir, f"{base_stem} - Details", "md", cid)
-                write_details_markdown(details_path, info)
-                print(f"  -> Saved Details MD: {details_path.name}")
-
-            if info["lessons_body"]:
-                lessons_path = unique_filepath(output_dir, f"{base_stem} - Lessons", "md", cid)
-                write_lessons_markdown(lessons_path, info)
-                print(f"  -> Saved Lessons MD: {lessons_path.name}")
-
-            records.append(
-                CourseRecord(
-                    course_id=cid,
-                    title=title,
-                    year=year,
-                    instructor=str(info["instructor"]),
-                    institute=str(info["institute"]),
-                    duration=str(info["duration"]),
-                    course_url=str(info["course_url"]),
-                    syllabus_format=fmt,
-                    syllabus_source_url=source_url,
-                    saved_file=str(saved_path.name) if saved_path else "",
-                    details_file=str(details_path.name) if details_path else "",
-                    lessons_file=str(lessons_path.name) if lessons_path else "",
-                )
-            )
-            time.sleep(delay)
-
         browser.close()
 
-    save_metadata(output_dir, records, merge_existing=bool(course_ids))
+    skip_ids: set[str] = set()
+    if resume:
+        meta_path = output_dir / "courses_metadata.json"
+        if meta_path.exists():
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+            skip_ids.update(str(r["course_id"]) for r in existing if r.get("syllabus_format") != "failed")
+
+    for ex_path in exclude_metadata or []:
+        if ex_path.exists():
+            existing = json.loads(ex_path.read_text(encoding="utf-8"))
+            skip_ids.update(str(r["course_id"]) for r in existing if r.get("syllabus_format") != "failed")
+
+    if skip_ids:
+        before = len(courses)
+        courses = [c for c in courses if c["course_id"] not in skip_ids]
+        print(f"Skipping {before - len(courses)} already-scraped courses; {len(courses)} remaining.")
+
+    total = len(courses)
+    if total == 0:
+        print("Nothing to scrape.")
+        return
+
+    thread_local = threading.local()
+    active_browsers: list[tuple[object, Browser]] = []
+    browsers_lock = threading.Lock()
+
+    def get_worker_page() -> Page:
+        if not hasattr(thread_local, "page"):
+            pw = sync_playwright().start()
+            br = pw.chromium.launch(headless=headless)
+            ctx = br.new_context(user_agent=HEADERS["User-Agent"])
+            pg = ctx.new_page()
+            pg.route(
+                "**/*.{png,jpg,jpeg,gif,svg,webp,woff,woff2,ttf,mp4,mp3}",
+                lambda route: route.abort(),
+            )
+            thread_local.pw = pw
+            thread_local.browser = br
+            thread_local.page = pg
+            with browsers_lock:
+                active_browsers.append((pw, br))
+        return thread_local.page
+
+    def worker_task(idx_item: tuple[int, dict[str, str]]) -> CourseRecord:
+        idx, item = idx_item
+        pg = get_worker_page()
+        return _process_single_course(item, idx, total, output_dir, pg, file_lock, delay)
+
+    try:
+        if workers <= 1:
+            for idx, item in enumerate(courses, start=1):
+                rec = worker_task((idx, item))
+                records.append(rec)
+                if idx % 50 == 0:
+                    save_metadata(output_dir, records, merge_existing=bool(course_ids) or resume)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(worker_task, (idx, item))
+                    for idx, item in enumerate(courses, start=1)
+                ]
+                completed = 0
+                for fut in as_completed(futures):
+                    records.append(fut.result())
+                    completed += 1
+                    if completed % 50 == 0:
+                        with file_lock:
+                            save_metadata(output_dir, records, merge_existing=bool(course_ids) or resume)
+    finally:
+        for pw, br in active_browsers:
+            try:
+                br.close()
+            except Exception:
+                pass
+            try:
+                pw.stop()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    save_metadata(output_dir, records, merge_existing=bool(course_ids) or resume)
     pdf_count = sum(1 for r in records if r.syllabus_format == "pdf")
     md_count = sum(1 for r in records if r.syllabus_format == "md")
     fail_count = sum(1 for r in records if r.syllabus_format == "failed")
@@ -672,6 +795,18 @@ def main() -> None:
         help="Also scrape https://nptel.ac.in/courses to discover additional 106* courses",
     )
     parser.add_argument(
+        "--discover-all",
+        action="store_true",
+        help="Discover ALL courses (all disciplines) from https://nptel.ac.in/courses",
+    )
+    parser.add_argument(
+        "--exclude-metadata",
+        action="append",
+        type=Path,
+        default=None,
+        help="Path to an existing courses_metadata.json whose already-scraped courses should be skipped (repeatable)",
+    )
+    parser.add_argument(
         "--course-ids",
         nargs="+",
         default=None,
@@ -690,6 +825,17 @@ def main() -> None:
         help="Delay in seconds between course requests (default: 0.5)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent browser workers (default: 1)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip courses already present in courses_metadata.json",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
         help="Run Chromium in headed (visible) mode for debugging",
@@ -703,6 +849,10 @@ def main() -> None:
         delay=args.delay,
         headless=not args.headed,
         course_ids=args.course_ids,
+        workers=args.workers,
+        resume=args.resume,
+        discover_all=args.discover_all,
+        exclude_metadata=args.exclude_metadata,
     )
 
 
