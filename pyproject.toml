@@ -1,0 +1,10 @@
+[project]
+name = "nptel-cse-scraper"
+version = "0.1.0"
+description = "Scrape NPTEL Computer Science & Engineering (CSE) course info and syllabi (PDF or Markdown)"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4>=4.12.3",
+    "playwright>=1.49.0",
+    "requests>=2.32.3",
+]
